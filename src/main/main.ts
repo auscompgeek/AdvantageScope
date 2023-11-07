@@ -1993,6 +1993,9 @@ function checkForUpdate(alwaysPrompt: boolean) {
 // "unsafe-eval" is required in the hub for protobufjs
 process.env["ELECTRON_DISABLE_SECURITY_WARNINGS"] = "true";
 
+// Fix Wayland window scaling
+app.commandLine.appendSwitch("ozone-platform-hint", "auto");
+
 app.whenReady().then(() => {
   // Check preferences and set theme
   if (!fs.existsSync(PREFS_FILENAME)) {
