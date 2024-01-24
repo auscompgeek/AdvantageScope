@@ -1,6 +1,7 @@
 import {
   BrowserWindow,
   BrowserWindowConstructorOptions,
+  FileFilter,
   Menu,
   MenuItem,
   MessageChannelMain,
@@ -8,6 +9,7 @@ import {
   TouchBar,
   TouchBarSlider,
   app,
+  clipboard,
   dialog,
   nativeImage,
   nativeTheme,
@@ -27,9 +29,11 @@ import NamedMessage from "../shared/NamedMessage";
 import Preferences from "../shared/Preferences";
 import TabType, { getAllTabTypes, getDefaultTabTitle, getTabIcon } from "../shared/TabType";
 import { BUILD_DATE, COPYRIGHT, DISTRIBUTOR, Distributor } from "../shared/buildConstants";
+import { MERGE_MAX_FILES } from "../shared/log/LogUtil";
 import { UnitConversionPreset } from "../shared/units";
 import { jsonCopy } from "../shared/util";
 import {
+  DEFAULT_LOGS_FOLDER,
   DEFAULT_PREFS,
   DOWNLOAD_CONNECT_TIMEOUT_MS,
   DOWNLOAD_PASSWORD,
@@ -37,7 +41,6 @@ import {
   DOWNLOAD_RETRY_DELAY_MS,
   DOWNLOAD_USERNAME,
   LAST_OPEN_FILE,
-  OPEN_DEFAULT_PATH,
   PATHPLANNER_CONNECT_TIMEOUT_MS,
   PATHPLANNER_DATA_TIMEOUT_MS,
   PATHPLANNER_PING_DELAY_MS,
@@ -57,6 +60,7 @@ import UpdateChecker from "./UpdateChecker";
 import { VideoProcessor } from "./VideoProcessor";
 import { getAssetDownloadStatus, startAssetDownload } from "./assetsDownload";
 import { convertLegacyAssets, createAssetFolders, loadAssets } from "./assetsUtil";
+import { checkHootIsPro, convertHoot, copyOwlet } from "./hootUtil";
 
 // Global variables
 let hubWindows: BrowserWindow[] = []; // Ordered by last focus time (recent first)
@@ -194,29 +198,94 @@ function handleHubMessage(window: BrowserWindow, message: NamedMessage) {
       paths.forEach((path) => app.addRecentDocument(path));
       fs.writeFile(LAST_OPEN_FILE, paths[0], () => {});
 
-      // Read data from file
+      // Send data if all file reads finished
       let completedCount = 0;
-      let results: (Buffer | null)[] = paths.map(() => null);
-      paths.forEach((path, index) => {
-        fs.open(path, "r", (error, file) => {
-          if (error) {
-            completedCount++;
-            if (completedCount === paths.length) {
-              sendMessage(window, "historical-data", results);
-            }
-            return;
-          }
-          fs.readFile(file, (error, buffer) => {
-            completedCount++;
-            if (!error) {
-              results[index] = buffer;
-            }
-            if (completedCount === paths.length) {
-              sendMessage(window, "historical-data", results);
-            }
+      let targetCount = 0;
+      let errorMessage: null | string = null;
+      let hasHootNonPro = false;
+      let sendIfReady = () => {
+        if (completedCount === targetCount) {
+          sendMessage(window, "historical-data", {
+            files: results,
+            error: errorMessage,
+            hasHootNonPro: hasHootNonPro
           });
-        });
+        }
+      };
+
+      // Read data from file
+      let results: (Buffer | null)[][] = paths.map(() => [null]);
+      paths.forEach((path, index) => {
+        let openPath = (path: string, callback: (buffer: Buffer) => void) => {
+          fs.open(path, "r", (error, file) => {
+            if (error) {
+              completedCount++;
+              sendIfReady();
+              return;
+            }
+            fs.readFile(file, (error, buffer) => {
+              completedCount++;
+              if (!error) {
+                callback(buffer);
+              }
+              sendIfReady();
+            });
+          });
+        };
+        if (path.endsWith(".dslog")) {
+          // DSLog, open DSEvents too
+          results[index] = [null, null];
+          targetCount += 2;
+          openPath(path, (buffer) => (results[index][0] = buffer));
+          openPath(path.slice(0, path.length - 5) + "dsevents", (buffer) => (results[index][1] = buffer));
+        } else if (path.endsWith(".hoot")) {
+          // Hoot, convert to WPILOG
+          targetCount += 1;
+          checkHootIsPro(path)
+            .then((isPro) => {
+              hasHootNonPro = hasHootNonPro || !isPro;
+            })
+            .finally(() => {
+              convertHoot(path)
+                .then((wpilogPath) => {
+                  openPath(wpilogPath, (buffer) => {
+                    results[index][0] = buffer;
+                    fs.rmSync(wpilogPath);
+                  });
+                })
+                .catch((reason) => {
+                  errorMessage = reason;
+                  completedCount++;
+                  sendIfReady();
+                });
+            });
+        } else {
+          // Not DSLog, open normally
+          targetCount += 1;
+          openPath(path, (buffer) => (results[index][0] = buffer));
+        }
       });
+      break;
+
+    case "hoot-non-pro-warning":
+      dialog
+        .showMessageBox(window, {
+          type: "info",
+          title: "Alert",
+          message: "About Non-Pro Signals",
+          detail:
+            "This log includes CTRE devices that are not Phoenix Pro licensed. Not all signals are available for these devices (check the Phoenix 6 documentation for details).",
+          checkboxLabel: "Don't Show Again",
+          icon: WINDOW_ICON
+        })
+        .then((response) => {
+          if (response.checkboxChecked) {
+            let prefs: Preferences = jsonfile.readFileSync(PREFS_FILENAME);
+            prefs.skipHootNonProWarning = true;
+            jsonfile.writeFileSync(PREFS_FILENAME, prefs);
+            sendAllPreferences();
+          }
+        });
       break;
 
     case "live-rlog-start":
@@ -365,8 +434,18 @@ function handleHubMessage(window: BrowserWindow, message: NamedMessage) {
       let legend: string = message.data.legend;
       const editAxisMenu = new Menu();
 
-      // Left and right controls
-      if (legend !== "discrete") {
+      if (legend === "discrete") {
+        // Discrete controls
+        editAxisMenu.append(
+          new MenuItem({
+            label: "Add Enabled State",
+            click() {
+              sendMessage(window, "add-discrete-enabled");
+            }
+          })
+        );
+      } else {
+        // Left and right controls
         let lockedRange: [number, number] | null = message.data.lockedRange;
         let unitConversion: UnitConversionPreset = message.data.unitConversion;
 
@@ -485,19 +564,19 @@ function handleHubMessage(window: BrowserWindow, message: NamedMessage) {
             title: "Warning",
             message: "Incomplete data for export",
             detail:
-              'Some fields will not be available in the exported data. To save all fields from the server, the "Logging" live mode must be selected. Check the AdvantageScope documentation for details.',
+              'Some fields will not be available in the exported data. To save all fields from the server, the "Logging" live mode must be selected with NetworkTables, PathPlanner, or RLOG as the live source. Check the AdvantageScope documentation for details.',
             buttons: ["Continue", "Cancel"],
             icon: WINDOW_ICON
           })
           .then((value) => {
             if (value.response === 0) {
-              createExportWindow(window, message.data.path);
+              createExportWindow(window, message.data.supportsAkit, message.data.path);
             } else {
               sendMessage(window, "cancel-export");
             }
           });
       } else {
-        createExportWindow(window, message.data.path);
+        createExportWindow(window, message.data.supportsAkit, message.data.path);
       }
       break;
 
@@ -685,10 +764,27 @@ function downloadStart() {
                       })
                       .filter(
                         (file) =>
-                          !file.name.startsWith(".") && (file.name.endsWith(".rlog") || file.name.endsWith(".wpilog"))
+                          !file.name.startsWith(".") &&
+                          (file.name.endsWith(".rlog") || file.name.endsWith(".wpilog") || file.name.endsWith(".hoot"))
                       )
-                      .sort((a, b) => a.name.localeCompare(b.name))
-                      .reverse()
+                      .map((file) => {
+                        return {
+                          name: file.name,
+                          size: file.size,
+                          randomized:
+                            file.name.includes("TBD") || // WPILib DataLogManager
+                            (file.name.startsWith("Log_") && !file.name.includes("-")) // AdvantageKit
+                        };
+                      })
+                      .sort((a, b) => {
+                        if (a.randomized && !b.randomized) {
+                          return 1;
+                        } else if (!a.randomized && b.randomized) {
+                          return -1;
+                        } else {
+                          return -a.name.localeCompare(b.name);
+                        }
+                      })
                   );
                 }
 
@@ -743,11 +839,23 @@ function downloadSave(files: string[]) {
     selectPromise = dialog.showOpenDialog(downloadWindow, {
       title: "Select save location for robot logs",
       buttonLabel: "Save",
-      properties: ["openDirectory", "createDirectory", "dontAddToRecent"]
+      properties: ["openDirectory", "createDirectory", "dontAddToRecent"],
+      defaultPath: DEFAULT_LOGS_FOLDER
     });
   } else {
     let extension = path.extname(files[0]).slice(1);
-    let name = extension === "wpilog" ? "WPILib robot logs" : "Robot logs";
+    let name = "";
+    switch (extension) {
+      case "wpilog":
+        name = "WPILib robot log";
+        break;
+      case "rlog":
+        name = "Robot log";
+        break;
+      case "hoot":
+        name = "Hoot robot log";
+        break;
+    }
     selectPromise = dialog.showSaveDialog(downloadWindow, {
       title: "Select save location for robot log",
       defaultPath: files[0],
@@ -805,7 +913,7 @@ function downloadSave(files: string[]) {
                         downloadWindow?.destroy();
                         downloadStop();
                         hubWindows[0].focus();
-                        sendMessage(hubWindows[0], "open-file", savePath);
+                        sendMessage(hubWindows[0], "open-files", [savePath]);
                       }
                     });
                 }
@@ -904,7 +1012,7 @@ function setupMenu() {
       label: "File",
       submenu: [
         {
-          label: "Open Log...",
+          label: "Open...",
           accelerator: "CmdOrCtrl+O",
           click(_, window) {
             if (window === undefined || !hubWindows.includes(window)) return;
@@ -912,33 +1020,33 @@ function setupMenu() {
               .showOpenDialog(window, {
                 title: "Select a robot log file to open",
                 properties: ["openFile"],
-                filters: [{ name: "Robot logs", extensions: ["rlog", "wpilog", "dslog", "dsevents"] }],
-                defaultPath: OPEN_DEFAULT_PATH
+                filters: [{ name: "Robot logs", extensions: ["rlog", "wpilog", "dslog", "dsevents", "hoot"] }],
+                defaultPath: DEFAULT_LOGS_FOLDER
               })
               .then((files) => {
                 if (files.filePaths.length > 0) {
-                  sendMessage(window, "open-file", files.filePaths[0]);
+                  sendMessage(window, "open-files", [files.filePaths[0]]);
                 }
               });
           }
         },
         {
-          label: "Merge Log...",
+          label: "Open Multiple...",
           accelerator: "CmdOrCtrl+Shift+O",
-          click(_, window) {
+          async click(_, window) {
             if (window === undefined || !hubWindows.includes(window)) return;
-            dialog
-              .showOpenDialog(window, {
-                title: "Select a robot log file to merge with the current data",
-                properties: ["openFile"],
-                filters: [{ name: "Robot logs", extensions: ["rlog", "wpilog", "dslog", "dsevents"] }],
-                defaultPath: OPEN_DEFAULT_PATH
-              })
-              .then((files) => {
-                if (files.filePaths.length > 0) {
-                  sendMessage(window, "open-file-merge", files.filePaths[0]);
-                }
-              });
+            let filesResponse = await dialog.showOpenDialog(window, {
+              title: "Select up to " + MERGE_MAX_FILES.toString() + " robot log files to open",
+              message: "Up to " + MERGE_MAX_FILES.toString() + " files can be opened together",
+              properties: ["openFile", "multiSelections"],
+              filters: [{ name: "Robot logs", extensions: ["rlog", "wpilog", "dslog", "dsevents", "hoot"] }],
+              defaultPath: DEFAULT_LOGS_FOLDER
+            });
+            let files = filesResponse.filePaths;
+            if (files.length === 0) {
+              return;
+            }
+            sendMessage(window, "open-files", files.slice(0, MERGE_MAX_FILES));
           }
         },
         {
@@ -1230,6 +1338,12 @@ function setupMenu() {
           }
         },
         {
+          label: "Contact Us",
+          click() {
+            shell.openExternal("mailto:software@team6328.org");
+          }
+        },
+        {
           label: "GitHub Repository",
           click() {
             shell.openExternal("https://github.com/" + REPOSITORY);
@@ -1350,14 +1464,22 @@ function createAboutWindow() {
   detailLines.push("Electron: " + process.versions.electron);
   detailLines.push("Chromium: " + process.versions.chrome);
   detailLines.push("Node: " + process.versions.node);
-  dialog.showMessageBox({
-    type: "info",
-    title: "About",
-    message: "AdvantageScope",
-    detail: COPYRIGHT + "\n\n" + detailLines.join("\n"),
-    buttons: ["Close"],
-    icon: WINDOW_ICON
-  });
+  let detail = detailLines.join("\n");
+  dialog
+    .showMessageBox({
+      type: "info",
+      title: "About",
+      message: "AdvantageScope",
+      detail: COPYRIGHT + "\n\n" + detail,
+      buttons: ["Close", "Copy & Close"],
+      defaultId: 0,
+      icon: WINDOW_ICON
+    })
+    .then((response) => {
+      if (response.response === 1) {
+        clipboard.writeText(detail);
+      }
+    });
 }
 
 /** Creates a new hub window. */
@@ -1688,12 +1810,17 @@ function createEditFovWindow(parentWindow: Electron.BrowserWindow, fov: number, 
 /**
  * Creates a new window for export options.
  * @param parentWindow The parent window to use for alignment
+ * @param supportsAkit Whether AdvantageKit timestamps are supported
  * @param currentLogPath The current log path
  */
-function createExportWindow(parentWindow: Electron.BrowserWindow, currentLogPath: string | null) {
+function createExportWindow(
+  parentWindow: Electron.BrowserWindow,
+  supportsAkit: boolean,
+  currentLogPath: string | null
+) {
   const exportWindow = new BrowserWindow({
     width: 300,
-    height: process.platform === "win32" ? 179 : 162, // "useContentSize" is broken on Windows when not resizable
+    height: process.platform === "win32" ? 206 : 189, // "useContentSize" is broken on Windows when not resizable
     useContentSize: true,
     resizable: false,
     icon: WINDOW_ICON,
@@ -1723,23 +1850,31 @@ function createExportWindow(parentWindow: Electron.BrowserWindow, currentLogPath
       } else if (typeof event.data === "object") {
         // Confirm
         let exportOptions: ExportOptions = event.data;
-        let extension = exportOptions.format === "wpilog" ? "wpilog" : "csv";
+        let extension = exportOptions.format.startsWith("csv") ? "csv" : exportOptions.format;
         let defaultPath = undefined;
         if (currentLogPath !== null) {
           let pathComponents = currentLogPath.split(".");
           pathComponents.pop();
           defaultPath = pathComponents.join(".") + "." + extension;
         }
+        let fileFilters: FileFilter[] = [];
+        switch (extension) {
+          case "csv":
+            fileFilters = [{ name: "Comma-separated values", extensions: ["csv"] }];
+            break;
+          case "wpilog":
+            fileFilters = [{ name: "WPILib robot log", extensions: ["wpilog"] }];
+            break;
+          case "mcap":
+            fileFilters = [{ name: "MCAP log", extensions: ["mcap"] }];
+            break;
+        }
         dialog
           .showSaveDialog(exportWindow, {
             title: "Select export location for robot log",
             defaultPath: defaultPath,
             properties: ["createDirectory", "showOverwriteConfirmation", "dontAddToRecent"],
-            filters: [
-              extension === "csv"
-                ? { name: "Comma-separated values", extensions: ["csv"] }
-                : { name: "WPILib robot logs", extensions: ["wpilog"] }
-            ]
+            filters: fileFilters
           })
           .then((response) => {
             if (!response.canceled) {
@@ -1751,6 +1886,7 @@ function createExportWindow(parentWindow: Electron.BrowserWindow, currentLogPath
     });
     exportWindow.on("blur", () => port2.postMessage({ isFocused: false }));
     exportWindow.on("focus", () => port2.postMessage({ isFocused: true }));
+    port2.postMessage({ supportsAkit: supportsAkit });
     port2.start();
   });
   exportWindow.loadFile(path.join(__dirname, "../www/export.html"));
@@ -2024,6 +2160,7 @@ app.whenReady().then(() => {
       "liveMode" in oldPrefs &&
       (oldPrefs.liveMode === "nt4" ||
         oldPrefs.liveMode === "nt4-akit" ||
+        oldPrefs.liveMode === "phoenix" ||
         oldPrefs.liveMode === "pathplanner" ||
         oldPrefs.liveMode === "rlog")
     ) {
@@ -2083,7 +2220,9 @@ app.whenReady().then(() => {
     if ("tbaApiKey" in oldPrefs && typeof oldPrefs.tbaApiKey === "string") {
       prefs.tbaApiKey = oldPrefs.tbaApiKey;
     }
-
+    if ("skipHootNonProWarning" in oldPrefs && typeof oldPrefs.skipHootNonProWarning === "boolean") {
+      prefs.skipHootNonProWarning = oldPrefs.skipHootNonProWarning;
+    }
     jsonfile.writeFileSync(PREFS_FILENAME, prefs);
     nativeTheme.themeSource = prefs.theme;
   }
@@ -2119,7 +2258,9 @@ app.whenReady().then(() => {
 
   // Open file if exists
   if (firstOpenPath !== null) {
-    sendMessage(window, "open-file", firstOpenPath);
+    window.webContents.once("dom-ready", () => {
+      sendMessage(window, "open-files", [firstOpenPath]);
+    });
   }
 
   // Create new window if activated while none exist
@@ -2131,6 +2272,9 @@ app.whenReady().then(() => {
   if (DISTRIBUTOR === Distributor.FRC6328) {
     checkForUpdate(false);
   }
+
+  // Copy current owlet version to cache
+  copyOwlet();
 });
 
 app.on("window-all-closed", () => {
@@ -2143,7 +2287,9 @@ app.on("open-file", (_, path) => {
   if (app.isReady()) {
     // Already running, create a new window
     let window = createHubWindow();
-    sendMessage(window, "open-file", path);
+    window.webContents.once("dom-ready", () => {
+      sendMessage(window, "open-files", [path]);
+    });
   } else {
     // Not running yet, open in first window
     firstOpenPath = path;

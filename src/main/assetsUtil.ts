@@ -138,11 +138,12 @@ export function loadAssets(): AdvantageScopeAssets {
           // ***** 2D FIELD *****
           let config: Config2d = {
             name: "",
-            path: path.join(parentFolder, object.name, "image.png"),
+            path: encodePath(path.join(parentFolder, object.name, "image.png")),
             topLeft: [0, 0],
             bottomRight: [0, 0],
             widthInches: 0,
-            heightInches: 0
+            heightInches: 0,
+            defaultOrigin: "auto"
           };
           if ("name" in configRaw && typeof configRaw.name === "string") {
             config.name = configRaw.name;
@@ -170,15 +171,25 @@ export function loadAssets(): AdvantageScopeAssets {
           if ("heightInches" in configRaw && typeof configRaw.heightInches === "number") {
             config.heightInches = configRaw.heightInches;
           }
+          if (
+            "defaultOrigin" in configRaw &&
+            typeof configRaw.defaultOrigin === "string" &&
+            (configRaw.defaultOrigin === "auto" ||
+              configRaw.defaultOrigin === "red" ||
+              configRaw.defaultOrigin === "blue")
+          ) {
+            config.defaultOrigin = configRaw.defaultOrigin;
+          }
           assets.field2ds.push(config);
         } else if (isField3d) {
           // ***** 3D FIELD *****
           let config: Config3dField = {
             name: "",
-            path: path.join(parentFolder, object.name, "model.glb"),
+            path: encodePath(path.join(parentFolder, object.name, "model.glb")),
             rotations: [],
             widthInches: 0,
-            heightInches: 0
+            heightInches: 0,
+            defaultOrigin: "auto"
           };
           if ("name" in configRaw && typeof configRaw.name === "string") {
             config.name = configRaw.name;
@@ -206,12 +217,21 @@ export function loadAssets(): AdvantageScopeAssets {
           if ("heightInches" in configRaw && typeof configRaw.heightInches === "number") {
             config.heightInches = configRaw.heightInches;
           }
+          if (
+            "defaultOrigin" in configRaw &&
+            typeof configRaw.defaultOrigin === "string" &&
+            (configRaw.defaultOrigin === "auto" ||
+              configRaw.defaultOrigin === "red" ||
+              configRaw.defaultOrigin === "blue")
+          ) {
+            config.defaultOrigin = configRaw.defaultOrigin;
+          }
           assets.field3ds.push(config);
         } else if (isRobot) {
           // ***** 3D ROBOT *****
           let config: Config3dRobot = {
             name: "",
-            path: path.join(parentFolder, object.name, "model.glb"),
+            path: encodePath(path.join(parentFolder, object.name, "model.glb")),
             rotations: [],
             position: [0, 0, 0],
             cameras: [],
@@ -325,7 +345,7 @@ export function loadAssets(): AdvantageScopeAssets {
           // ***** JOYSTICK *****
           let config: ConfigJoystick = {
             name: "",
-            path: path.join(parentFolder, object.name, "image.png"),
+            path: encodePath(path.join(parentFolder, object.name, "image.png")),
             components: []
           };
           if ("name" in configRaw && typeof configRaw.name === "string") {
@@ -501,4 +521,21 @@ export function loadAssets(): AdvantageScopeAssets {
   }
 
   return assets;
+}
+
+/**
+ * Encodes a path with special characters.
+ */
+function encodePath(pathStr: string): string {
+  return pathStr
+    .split(path.sep)
+    .map((component, index) => {
+      if (index === 0 && component.endsWith(":")) {
+        // Windows drive letter
+        return component;
+      } else {
+        return encodeURIComponent(component);
+      }
+    })
+    .join(path.sep);
 }

@@ -1,5 +1,4 @@
 import { TabGroupState } from "../shared/HubState";
-import { ENABLED_KEYS } from "../shared/log/LogUtil";
 import TabType, { getDefaultTabTitle, getTabIcon, TIMELINE_VIZ_TYPES } from "../shared/TabType";
 import { UnitConversionPreset } from "../shared/units";
 import ScrollSensor from "./ScrollSensor";
@@ -160,7 +159,7 @@ export default class Tabs {
     });
   }
 
-  /** Refresh based on new log data. */
+  /** Refresh based on a new set of assets. */
   newAssets() {
     this.tabList.forEach((tab) => {
       tab.controller.newAssets();
@@ -175,10 +174,6 @@ export default class Tabs {
         activeFields.add(field);
       });
     });
-    let enabledKey = ENABLED_KEYS.find((key) => window.log.getFieldKeys().includes(key));
-    if (enabledKey !== undefined) {
-      activeFields.add(enabledKey);
-    }
     return activeFields;
   }
 
@@ -327,6 +322,13 @@ export default class Tabs {
     tab.titleElement.innerText = getTabIcon(tab.type) + " " + name;
     if (TIMELINE_VIZ_TYPES.includes(tab.type)) {
       (tab.controller as TimelineVizController).setTitle(name);
+    }
+  }
+
+  /** Adds the enabled field to the discrete legend on the selected line graph. */
+  addDiscreteEnabled() {
+    if (this.tabList[this.selectedTab].type === TabType.LineGraph) {
+      (this.tabList[this.selectedTab].controller as LineGraphController).addDiscreteEnabled();
     }
   }
 

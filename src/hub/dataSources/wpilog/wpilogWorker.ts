@@ -1,7 +1,8 @@
-import Log from "../../shared/log/Log";
-import LoggableType from "../../shared/log/LoggableType";
-import CustomSchemas from "./schema/CustomSchemas";
-import { WPILOGDecoder } from "./wpilog/WPILOGDecoder";
+import Log from "../../../shared/log/Log";
+import { PROTO_PREFIX, STRUCT_PREFIX } from "../../../shared/log/LogUtil";
+import LoggableType from "../../../shared/log/LoggableType";
+import CustomSchemas from "../schema/CustomSchemas";
+import { WPILOGDecoder } from "./WPILOGDecoder";
 
 self.onmessage = (event) => {
   // WORKER SETUP
@@ -63,6 +64,12 @@ self.onmessage = (event) => {
               break;
           }
           log.setWpilibType(startData.name, startData.type);
+          log.setMetadataString(startData.name, startData.metadata);
+        } else if (record.isSetMetadata()) {
+          let setMetadataData = record.getSetMetadataData();
+          if (setMetadataData.entry in entryIds) {
+            log.setMetadataString(entryIds[setMetadataData.entry], setMetadataData.metadata);
+          }
         }
       } else {
         let key = entryIds[record.getEntry()];
@@ -109,20 +116,24 @@ self.onmessage = (event) => {
               log.putMsgpack(key, timestamp, record.getRaw());
               break;
             default: // Default to raw
-              if (type.startsWith("struct:")) {
-                let schemaType = type.split("struct:")[1];
+              if (type.startsWith(STRUCT_PREFIX)) {
+                let schemaType = type.split(STRUCT_PREFIX)[1];
                 if (schemaType.endsWith("[]")) {
                   log.putStruct(key, timestamp, record.getRaw(), schemaType.slice(0, -2), true);
                 } else {
                   log.putStruct(key, timestamp, record.getRaw(), schemaType, false);
                 }
-              } else if (type.startsWith("proto:")) {
-                let schemaType = type.split("proto:")[1];
+              } else if (type.startsWith(PROTO_PREFIX)) {
+                let schemaType = type.split(PROTO_PREFIX)[1];
                 log.putProto(key, timestamp, record.getRaw(), schemaType);
               } else {
                 log.putRaw(key, timestamp, record.getRaw());
                 if (CustomSchemas.has(type)) {
-                  CustomSchemas.get(type)!(log, key, timestamp, record.getRaw());
+                  try {
+                    CustomSchemas.get(type)!(log, key, timestamp, record.getRaw());
+                  } catch {
+                    console.error('Failed to decode custom schema "' + type + '"');
+                  }
                   log.setGeneratedParent(key);
                 }
               }

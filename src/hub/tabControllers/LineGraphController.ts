@@ -1,11 +1,11 @@
 import { AllColors } from "../../shared/Colors";
 import { LineGraphState } from "../../shared/HubState";
 import TabType from "../../shared/TabType";
-import { getLogValueText } from "../../shared/log/LogUtil";
+import { getEnabledKey, getLogValueText } from "../../shared/log/LogUtil";
 import { LogValueSetAny, LogValueSetNumber } from "../../shared/log/LogValueSets";
 import LoggableType from "../../shared/log/LoggableType";
 import { UnitConversionPreset, convertWithPreset } from "../../shared/units";
-import { clampValue, cleanFloat, scaleValue, shiftColor } from "../../shared/util";
+import { ValueScaler, clampValue, cleanFloat, scaleValue, shiftColor } from "../../shared/util";
 import ScrollSensor from "../ScrollSensor";
 import { SelectionMode } from "../Selection";
 import TabController from "../TabController";
@@ -68,6 +68,8 @@ export default class LineGraphController implements TabController {
   private panStartCursorX = 0;
   private panLastCursorX = 0;
   private scrollSensor: ScrollSensor;
+  private lastRenderState = "";
+  private refreshCount = 0;
 
   constructor(content: HTMLElement) {
     this.CONTENT = content;
@@ -244,6 +246,13 @@ export default class LineGraphController implements TabController {
       this.RIGHT_LABELS.innerText = "";
     }
   }
+  /** Adds the enabled field to the discrete legend. */
+  addDiscreteEnabled() {
+    let enabledKey = getEnabledKey(window.log);
+    if (enabledKey !== undefined) {
+      this.addField("discrete", enabledKey);
+    }
+  }
 
   /** Adjusts the locked range and unit conversion for an axis. */
   editAxis(legend: string, lockedRange: [number, number] | null, unitConversion: UnitConversionPreset) {
@@ -295,6 +304,7 @@ export default class LineGraphController implements TabController {
 
   refresh() {
     this.updateScroll();
+    this.refreshCount += 1;
 
     // Update field strikethrough
     let availableFields = window.log.getFieldKeys();
@@ -510,7 +520,8 @@ export default class LineGraphController implements TabController {
     }
 
     // Apply vertical scroll
-    if (dy !== 0) {
+    if (dy !== 0 && (!this.maxZoom || dy < 0)) {
+      // If max zoom, ignore positive scroll (no effect, just apply the max zoom)
       let zoomPercent = Math.pow(this.ZOOM_BASE, dy);
       let newZoom = (this.timestampRange[1] - this.timestampRange[0]) * zoomPercent;
       if (newZoom < this.MIN_ZOOM_TIME) newZoom = this.MIN_ZOOM_TIME;
@@ -678,12 +689,36 @@ export default class LineGraphController implements TabController {
     // Update to ensure smoothness when locked
     this.updateScroll(0, 0);
 
-    // Initial setup and scaling
+    // Calculate initial setup and scaling
     const devicePixelRatio = window.devicePixelRatio;
     let context = this.CANVAS.getContext("2d") as CanvasRenderingContext2D;
     let width = this.CANVAS_CONTAINER.clientWidth;
     let height = this.CANVAS_CONTAINER.clientHeight;
     let light = !window.matchMedia("(prefers-color-scheme: dark)").matches;
+
+    // Exit if render state unchanged
+    let renderState: any[] = [
+      width,
+      height,
+      light,
+      devicePixelRatio,
+      this.timestampRange,
+      this.lastCursorX,
+      this.refreshCount,
+      this.leftFields,
+      this.discreteFields,
+      this.rightFields,
+      window.selection.getMode(),
+      window.selection.getSelectedTime(),
+      window.selection.getHoveredTime()
+    ];
+    let renderStateString = JSON.stringify(renderState);
+    if (renderStateString === this.lastRenderState) {
+      return;
+    }
+    this.lastRenderState = renderStateString;
+
+    // Apply initial setup and scaling
     this.CANVAS.width = width * devicePixelRatio;
     this.CANVAS.height = height * devicePixelRatio;
     context.scale(devicePixelRatio, devicePixelRatio);
@@ -889,6 +924,7 @@ export default class LineGraphController implements TabController {
     });
 
     // Render continuous data
+    const xScaler = new ValueScaler(this.timestampRange, [graphLeft, graphLeft + graphWidth]);
     [
       { fields: visibleFieldsLeft, axis: leftAxis, unitConversion: this.leftUnitConversion },
       { fields: visibleFieldsRight, axis: rightAxis, unitConversion: this.rightUnitConversion }
@@ -897,6 +933,7 @@ export default class LineGraphController implements TabController {
         let data: LogValueSetNumber = dataCache[field.key];
         let axis = set.axis;
         let unitConversion = set.unitConversion;
+        const yScaler = new ValueScaler([axis.min, axis.max], [graphTop + graphHeightOpen, graphTop]);
         context.lineWidth = 1;
         context.strokeStyle = field.color;
         context.beginPath();
@@ -904,21 +941,19 @@ export default class LineGraphController implements TabController {
         // Render starting point
         context.moveTo(
           graphLeft + graphWidth,
-          scaleValue(
+          yScaler.calculate(
             clampValue(
               convertWithPreset(data.values[data.values.length - 1], unitConversion),
               -this.MAX_VALUE,
               this.MAX_VALUE
-            ),
-            [axis.min, axis.max],
-            [graphTop + graphHeightOpen, graphTop]
+            )
           )
         );
 
         // Render main data
         let i = data.values.length - 1;
         while (true) {
-          let x = scaleValue(data.timestamps[i], this.timestampRange, [graphLeft, graphLeft + graphWidth]);
+          let x = xScaler.calculate(data.timestamps[i]);
 
           // Render start of current data point
           let convertedValue = clampValue(
@@ -926,7 +961,7 @@ export default class LineGraphController implements TabController {
             -this.MAX_VALUE,
             this.MAX_VALUE
           );
-          context.lineTo(x, scaleValue(convertedValue, [axis.min, axis.max], [graphTop + graphHeightOpen, graphTop]));
+          context.lineTo(x, yScaler.calculate(convertedValue));
 
           // Find previous data point and vertical range
           let currentX = Math.floor(x * devicePixelRatio);
@@ -941,24 +976,19 @@ export default class LineGraphController implements TabController {
             );
             if (convertedValue < vertRange[0]) vertRange[0] = convertedValue;
             if (convertedValue > vertRange[1]) vertRange[1] = convertedValue;
-            newX = Math.floor(
-              scaleValue(data.timestamps[i], this.timestampRange, [graphLeft, graphLeft + graphWidth]) *
-                devicePixelRatio
-            );
+            newX = Math.floor(xScaler.calculate(data.timestamps[i]) * devicePixelRatio);
           } while (i >= 0 && newX >= currentX); // Compile values to vertical range until the pixel changes
           if (i < 0) break;
 
           // Render vertical range
-          context.moveTo(x, scaleValue(vertRange[0], [axis.min, axis.max], [graphTop + graphHeightOpen, graphTop]));
-          context.lineTo(x, scaleValue(vertRange[1], [axis.min, axis.max], [graphTop + graphHeightOpen, graphTop]));
+          context.moveTo(x, yScaler.calculate(vertRange[0]));
+          context.lineTo(x, yScaler.calculate(vertRange[1]));
 
           // Move to end of previous data point
           context.moveTo(
             x,
-            scaleValue(
-              clampValue(convertWithPreset(data.values[i], unitConversion), -this.MAX_VALUE, this.MAX_VALUE),
-              [axis.min, axis.max],
-              [graphTop + graphHeightOpen, graphTop]
+            yScaler.calculate(
+              clampValue(convertWithPreset(data.values[i], unitConversion), -this.MAX_VALUE, this.MAX_VALUE)
             )
           );
         }
@@ -1194,6 +1224,14 @@ export default class LineGraphController implements TabController {
     }
 
     // Update value preview
+    let previewTime: number | null = null;
+    if (selectionMode === SelectionMode.Playback || selectionMode === SelectionMode.Locked) {
+      previewTime = selectedTime as number;
+    } else if (hoveredTime !== null) {
+      previewTime = hoveredTime;
+    } else if (selectedTime !== null) {
+      previewTime = selectedTime;
+    }
     [
       [this.LEFT_LIST, this.leftFields],
       [this.DISCRETE_LIST, this.discreteFields],
@@ -1210,13 +1248,9 @@ export default class LineGraphController implements TabController {
         let valueElement = itemElement.getElementsByClassName("legend-value")[0] as HTMLElement;
         let key = fieldList[index - 1].key;
         let hasValue = false;
-        if (selectedTime !== null && availableKeys.includes(key)) {
-          let currentData = window.log.getRange(key, selectedTime as number, selectedTime as number);
-          if (
-            currentData &&
-            currentData.timestamps.length > 0 &&
-            currentData.timestamps[0] <= (selectedTime as number)
-          ) {
+        if (previewTime !== null && availableKeys.includes(key)) {
+          let currentData = window.log.getRange(key, previewTime, previewTime);
+          if (currentData && currentData.timestamps.length > 0 && currentData.timestamps[0] <= previewTime) {
             let value = currentData.values[0];
             if (legendIndex === 0) value = convertWithPreset(value, this.leftUnitConversion);
             if (legendIndex === 2) value = convertWithPreset(value, this.rightUnitConversion);
@@ -1226,7 +1260,7 @@ export default class LineGraphController implements TabController {
           }
         }
 
-        if (selectedTime !== null && availableKeys.includes(key) && hasValue) {
+        if (previewTime !== null && availableKeys.includes(key) && hasValue) {
           itemElement.classList.add("legend-item-with-value");
         } else {
           itemElement.classList.remove("legend-item-with-value");

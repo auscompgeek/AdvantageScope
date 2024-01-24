@@ -7,40 +7,74 @@ import LogFieldTree from "./LogFieldTree";
 import LoggableType from "./LoggableType";
 import { LogValueSetBoolean } from "./LogValueSets";
 
-export const ENABLED_KEYS = [
+export const TYPE_KEY = ".type";
+export const STRUCT_PREFIX = "struct:";
+export const PROTO_PREFIX = "proto:";
+export const MAX_SEARCH_RESULTS = 128;
+export const MERGE_PREFIX = "Log";
+export const MERGE_MAX_FILES = 10;
+export const SEPARATOR_REGEX = new RegExp(/\/|:/);
+export const SEPARATOR_REGEX_PHOENIX = new RegExp(/\/|:|_/);
+export const PHOENIX_PREFIX = "Phoenix6";
+export const ENABLED_KEYS = withMergedKeys([
   "/DriverStation/Enabled",
   "NT:/AdvantageKit/DriverStation/Enabled",
   "DS:enabled",
   "NT:/FMSInfo/FMSControlData",
-  "/DSLog/Status/DSDisabled"
-];
-export const ALLIANCE_KEYS = [
+  "/DSLog/Status/DSDisabled",
+  "RobotEnable" // Phoenix
+]);
+export const ALLIANCE_KEYS = withMergedKeys([
   "/DriverStation/AllianceStation",
   "NT:/AdvantageKit/DriverStation/AllianceStation",
   "NT:/FMSInfo/IsRedAlliance"
-];
-export const JOYSTICK_KEYS = ["/DriverStation/Joystick", "NT:/AdvantageKit/DriverStation/Joystick", "DS:joystick"];
-export const TYPE_KEY = ".type";
-export const SYSTEM_TIME_KEYS = [
+]);
+export const JOYSTICK_KEYS = withMergedKeys([
+  "/DriverStation/Joystick",
+  "NT:/AdvantageKit/DriverStation/Joystick",
+  "DS:joystick"
+]);
+export const SYSTEM_TIME_KEYS = withMergedKeys([
   "/SystemStats/EpochTimeMicros",
   "NT:/AdvantageKit/SystemStats/EpochTimeMicros",
   "systemTime"
-];
-export const EVENT_KEYS = [
+]);
+export const AKIT_TIMESTAMP_KEYS = withMergedKeys(["/Timestamp", "NT:/AdvantageKit/Timestamp"]);
+export const METADATA_KEYS = withMergedKeys([
+  "/Metadata",
+  "/RealMetadata",
+  "/ReplayMetadata",
+  "NT:/Metadata",
+  "NT:/AdvantageKit/RealMetadata",
+  "NT:/AdvantageKit/ReplayMetadata"
+]);
+export const EVENT_KEYS = withMergedKeys([
   "/DriverStation/EventName",
   "NT:/AdvantageKit/DriverStation/EventName",
   "NT:/FMSInfo/EventName"
-];
-export const MATCH_TYPE_KEYS = [
+]);
+export const MATCH_TYPE_KEYS = withMergedKeys([
   "/DriverStation/MatchType",
   "NT:/AdvantageKit/DriverStation/MatchType",
   "NT:/FMSInfo/MatchType"
-];
-export const MATCH_NUMBER_KEYS = [
+]);
+export const MATCH_NUMBER_KEYS = withMergedKeys([
   "/DriverStation/MatchNumber",
   "NT:/AdvantageKit/DriverStation/MatchNumber",
   "NT:/FMSInfo/MatchNumber"
-];
+]);
+
+/** Returns a set of keys starting with the merged log prefixes. */
+function withMergedKeys(keys: string[]): string[] {
+  let output: string[] = [];
+  keys.forEach((key) => {
+    output.push(key);
+    for (let i = 0; i < MERGE_MAX_FILES; i++) {
+      output.push("/" + MERGE_PREFIX + i.toString() + (key.startsWith("/") ? "" : "/") + key);
+    }
+  });
+  return output;
+}
 
 export function getLogValueText(value: any, type: LoggableType): string {
   if (value === null) {
@@ -84,6 +118,14 @@ export function logValuesEqual(type: LoggableType, a: any, b: any): boolean {
   }
 }
 
+export function splitLogKey(key: string): string[] {
+  if (key.startsWith(PHOENIX_PREFIX)) {
+    return key.split(SEPARATOR_REGEX_PHOENIX);
+  } else {
+    return key.split(SEPARATOR_REGEX);
+  }
+}
+
 export function filterFieldByPrefixes(
   fields: string[],
   prefixes: string,
@@ -92,10 +134,10 @@ export function filterFieldByPrefixes(
 ) {
   let filteredFields: Set<string> = new Set();
   prefixes.split(",").forEach((prefix) => {
-    let prefixSeries = prefix.split(new RegExp(/\/|:/)).filter((item) => item.length > 0);
+    let prefixSeries = splitLogKey(prefix).filter((item) => item.length > 0);
     if (ntOnly) prefixSeries.splice(0, 0, "NT");
     fields.forEach((field) => {
-      let fieldSeries = field.split(new RegExp(/\/|:/)).filter((item) => item.length > 0);
+      let fieldSeries = splitLogKey(field).filter((item) => item.length > 0);
       if (fieldSeries.length < prefixSeries.length) return;
       if (
         prefixSeries.every((prefix, index) => fieldSeries[index].toLowerCase() === prefix.toLowerCase()) ||
@@ -108,8 +150,12 @@ export function filterFieldByPrefixes(
   return [...filteredFields];
 }
 
+export function getEnabledKey(log: Log): string | undefined {
+  return ENABLED_KEYS.find((key) => log.getFieldKeys().includes(key));
+}
+
 export function getEnabledData(log: Log): LogValueSetBoolean | null {
-  let enabledKey = ENABLED_KEYS.find((key) => log.getFieldKeys().includes(key));
+  let enabledKey = getEnabledKey(log);
   if (!enabledKey) return null;
   let enabledData: LogValueSetBoolean | null = null;
   if (enabledKey.endsWith("FMSControlData")) {
@@ -124,7 +170,7 @@ export function getEnabledData(log: Log): LogValueSetBoolean | null {
     let tempEnabledData = log.getBoolean(enabledKey, -Infinity, Infinity);
     if (!tempEnabledData) return null;
     enabledData = tempEnabledData;
-    if (enabledKey === "/DSLog/Status/DSDisabled") {
+    if (enabledKey.endsWith("DSDisabled")) {
       enabledData = {
         timestamps: enabledData.timestamps,
         values: enabledData.values.map((value) => !value)
@@ -172,16 +218,17 @@ export function getJoystickState(log: Log, joystickId: number, time: number): Jo
   // Find joystick table
   let tablePrefix = "";
   let isAkit = false;
-  if (log.getFieldKeys().find((key) => key.startsWith(JOYSTICK_KEYS[0] + joystickId.toString())) !== undefined) {
-    tablePrefix = JOYSTICK_KEYS[0] + joystickId.toString() + "/";
-    isAkit = true;
-  } else if (log.getFieldKeys().find((key) => key.startsWith(JOYSTICK_KEYS[1] + joystickId.toString())) !== undefined) {
-    tablePrefix = JOYSTICK_KEYS[1] + joystickId.toString() + "/";
-    isAkit = true;
-  } else if (log.getFieldKeys().find((key) => key.startsWith(JOYSTICK_KEYS[2] + joystickId.toString())) !== undefined) {
-    tablePrefix = JOYSTICK_KEYS[2] + joystickId.toString() + "/";
-    isAkit = false;
-  } else {
+  log.getFieldKeys().forEach((key) => {
+    if (tablePrefix !== "") return;
+    JOYSTICK_KEYS.forEach((joystickKey) => {
+      if (tablePrefix !== "") return;
+      if (key.startsWith(joystickKey + joystickId.toString())) {
+        tablePrefix = joystickKey + joystickId.toString() + "/";
+        isAkit = joystickKey.endsWith("/DriverStation/Joystick");
+      }
+    });
+  });
+  if (tablePrefix === "") {
     // No joystick data found
     return state;
   }
@@ -345,10 +392,9 @@ export function mergeMechanismStates(states: MechanismState[]): MechanismState {
 }
 
 export function searchFields(log: Log, query: string): string[] {
+  if (query.length == 1) return [];
   query = query.toLowerCase();
-  let fieldStrings = log
-    .getFieldKeys()
-    .filter((field) => !log.isGenerated(field) && field.toLowerCase().includes(query));
+  let fieldStrings = log.getFieldKeys().filter((field) => field.toLowerCase().includes(query));
   let fields = fieldStrings.map((field) => {
     return {
       string: field,
@@ -358,7 +404,10 @@ export function searchFields(log: Log, query: string): string[] {
   fields.sort((a, b) => a.string.localeCompare(b.string, undefined, { numeric: true }));
   fields.sort((a, b) => a.string.length - b.string.length);
   fields.sort((a, b) => a.endDistance - b.endDistance);
-  return fields.map((field) => field.string);
+  return fields
+    .slice(0, MAX_SEARCH_RESULTS)
+    .map((field) => field.string)
+    .filter((field) => !log.isGenerated(field));
 }
 
 export function getMatchInfo(log: Log): MatchInfo | null {

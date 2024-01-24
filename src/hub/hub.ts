@@ -2,17 +2,19 @@ import { AdvantageScopeAssets } from "../shared/AdvantageScopeAssets";
 import { HubState } from "../shared/HubState";
 import { SIM_ADDRESS, USB_ADDRESS } from "../shared/IPAddresses";
 import Log from "../shared/log/Log";
-import { getEnabledData } from "../shared/log/LogUtil";
+import { AKIT_TIMESTAMP_KEYS } from "../shared/log/LogUtil";
 import NamedMessage from "../shared/NamedMessage";
 import Preferences from "../shared/Preferences";
 import { clampValue, htmlEncode, scaleValue } from "../shared/util";
 import { HistoricalDataSource, HistoricalDataSourceStatus } from "./dataSources/HistoricalDataSource";
 import { LiveDataSource, LiveDataSourceStatus } from "./dataSources/LiveDataSource";
+import LiveDataTuner from "./dataSources/LiveDataTuner";
 import loadZebra from "./dataSources/LoadZebra";
-import { NT4Publisher, NT4PublisherStatus } from "./dataSources/NT4Publisher";
-import NT4Source from "./dataSources/NT4Source";
+import { NT4Publisher, NT4PublisherStatus } from "./dataSources/nt4/NT4Publisher";
+import NT4Source from "./dataSources/nt4/NT4Source";
 import PathPlannerSource from "./dataSources/PathPlannerSource";
-import RLOGServerSource from "./dataSources/RLOGServerSource";
+import PhoenixDiagnosticsSource from "./dataSources/PhoenixDiagnosticsSource";
+import RLOGServerSource from "./dataSources/rlog/RLOGServerSource";
 import Selection from "./Selection";
 import Sidebar from "./Sidebar";
 import Tabs from "./Tabs";
@@ -40,6 +42,7 @@ declare global {
     selection: Selection;
     sidebar: Sidebar;
     tabs: Tabs;
+    tuner: LiveDataTuner | null;
     messagePort: MessagePort | null;
     sendMainMessage: (name: string, data?: any) => void;
     startDrag: (x: number, y: number, offsetX: number, offsetY: number, data: any) => void;
@@ -58,6 +61,7 @@ window.fps = false;
 window.selection = new Selection();
 window.sidebar = new Sidebar();
 window.tabs = new Tabs();
+window.tuner = null;
 window.messagePort = null;
 
 let historicalSource: HistoricalDataSource | null = null;
@@ -210,33 +214,43 @@ window.requestAnimationFrame(periodic);
 // DATA SOURCE HANDLING
 
 /** Connects to a historical data source. */
-function startHistorical(path: string, shouldMerge: boolean = false) {
+function startHistorical(paths: string[]) {
   historicalSource?.stop();
   liveSource?.stop();
+  window.tuner = null;
   liveActive = false;
   setLoading(null);
 
   historicalSource = new HistoricalDataSource();
   historicalSource.openFile(
-    path,
+    paths,
     (status: HistoricalDataSourceStatus) => {
-      let components = path.split(window.platform === "win32" ? "\\" : "/");
-      logFriendlyName = components[components.length - 1];
+      if (paths.length === 1) {
+        let components = paths[0].split(window.platform === "win32" ? "\\" : "/");
+        logFriendlyName = components[components.length - 1];
+      } else {
+        logFriendlyName = paths.length.toString() + " Log Files";
+      }
       switch (status) {
         case HistoricalDataSourceStatus.Reading:
         case HistoricalDataSourceStatus.Decoding:
-          if (!shouldMerge) setWindowTitle(logFriendlyName, "Loading");
+          setWindowTitle(logFriendlyName, "Loading");
           break;
         case HistoricalDataSourceStatus.Ready:
-          if (!shouldMerge) setWindowTitle(logFriendlyName);
+          setWindowTitle(logFriendlyName);
           setLoading(null);
           break;
         case HistoricalDataSourceStatus.Error:
-          if (!shouldMerge) setWindowTitle(logFriendlyName, "Error");
+          setWindowTitle(logFriendlyName, "Error");
           setLoading(null);
+          let message =
+            "There was a problem while reading the log file" + (paths.length === 1 ? "" : "s") + ". Please try again.";
+          if (historicalSource && historicalSource.getCustomError() !== null) {
+            message = historicalSource.getCustomError()!;
+          }
           window.sendMainMessage("error", {
-            title: "Failed to open log",
-            content: "There was a problem while reading the log file. Please try again."
+            title: "Failed to open log" + (paths.length === 1 ? "" : "s"),
+            content: message
           });
           break;
         case HistoricalDataSourceStatus.Stopped:
@@ -247,42 +261,8 @@ function startHistorical(path: string, shouldMerge: boolean = false) {
       setLoading(progress);
     },
     (log: Log) => {
-      if (shouldMerge && window.log.getFieldKeys().length > 0) {
-        // Check for field conflicts
-        let newFields = log.getFieldKeys();
-        let hasOverlap = false;
-        window.log.getFieldKeys().forEach((key) => {
-          if (newFields.includes(key)) hasOverlap = true;
-        });
-
-        // Generate prefix
-        let prefix = "";
-        if (hasOverlap) {
-          let i = 0;
-          let oldTree = window.log.getFieldTree();
-          while ("MergedLog" + i.toString() in oldTree) {
-            i += 1;
-          }
-          prefix = "/MergedLog" + i.toString();
-        }
-
-        // Merge based on first enable
-        let currentFirstEnable = 0;
-        let newFirstEnabled = 0;
-        let currentEnabledData = getEnabledData(window.log);
-        let newEnabledData = getEnabledData(log);
-        if (currentEnabledData && currentEnabledData.values.includes(true)) {
-          currentFirstEnable = currentEnabledData.timestamps[currentEnabledData.values.indexOf(true)];
-        }
-        if (newEnabledData && newEnabledData.values.includes(true)) {
-          newFirstEnabled = newEnabledData.timestamps[newEnabledData.values.indexOf(true)];
-        }
-        window.log = Log.mergeLogs(window.log, log, currentFirstEnable - newFirstEnabled, prefix);
-      } else {
-        window.log = log;
-        logPath = path;
-      }
-
+      window.log = log;
+      logPath = paths[0];
       liveConnected = false;
       window.sidebar.refresh();
       window.tabs.refresh();
@@ -296,6 +276,7 @@ function startLive(isSim: boolean) {
   liveSource?.stop();
   publisher?.stop();
   liveActive = true;
+  setLoading(null);
 
   if (!window.preferences) return;
   switch (window.preferences.liveMode) {
@@ -304,6 +285,9 @@ function startLive(isSim: boolean) {
       break;
     case "nt4-akit":
       liveSource = new NT4Source(true);
+      break;
+    case "phoenix":
+      liveSource = new PhoenixDiagnosticsSource();
       break;
     case "pathplanner":
       liveSource = new PathPlannerSource();
@@ -357,6 +341,7 @@ function startLive(isSim: boolean) {
       window.tabs.refresh();
     }
   );
+  window.tuner = liveSource.getTuner();
 }
 
 // File dropped on window
@@ -368,9 +353,12 @@ document.addEventListener("drop", (event) => {
   event.stopPropagation();
 
   if (event.dataTransfer) {
+    let files: string[] = [];
     for (const file of event.dataTransfer.files) {
-      startHistorical(file.path);
-      return;
+      files.push(file.path);
+    }
+    if (files.length > 0) {
+      startHistorical(files);
     }
   }
 });
@@ -476,7 +464,7 @@ function handleMainMessage(message: NamedMessage) {
       }
       break;
 
-    case "open-file":
+    case "open-files":
       if (isExporting) {
         window.sendMainMessage("error", {
           title: "Cannot open file",
@@ -484,17 +472,6 @@ function handleMainMessage(message: NamedMessage) {
         });
       } else {
         startHistorical(message.data);
-      }
-      break;
-
-    case "open-file-merge":
-      if (isExporting) {
-        window.sendMainMessage("error", {
-          title: "Cannot open file",
-          content: "Please wait for the export to finish, then try again."
-        });
-      } else {
-        startHistorical(message.data, true);
       }
       break;
 
@@ -585,6 +562,10 @@ function handleMainMessage(message: NamedMessage) {
       window.tabs.renameTab(message.data.index, message.data.name);
       break;
 
+    case "add-discrete-enabled":
+      window.tabs.addDiscreteEnabled();
+      break;
+
     case "edit-axis":
       window.tabs.editAxis(message.data.legend, message.data.lockedRange, message.data.unitConversion);
       break;
@@ -618,9 +599,14 @@ function handleMainMessage(message: NamedMessage) {
         });
       } else {
         isExporting = true;
+        const incompleteWarning =
+          liveConnected &&
+          (window.preferences?.liveSubscribeMode === "low-bandwidth" || window.preferences?.liveMode === "phoenix");
+        const supportsAkit = window.log.getFieldKeys().find((key) => AKIT_TIMESTAMP_KEYS.includes(key)) !== undefined;
         window.sendMainMessage("prompt-export", {
           path: logPath,
-          incompleteWarning: liveConnected && window.preferences?.liveSubscribeMode === "low-bandwidth"
+          incompleteWarning: incompleteWarning,
+          supportsAkit: supportsAkit
         });
       }
       break;
@@ -653,6 +639,7 @@ function handleMainMessage(message: NamedMessage) {
             title: "Failed to export data",
             content: "There was a problem while converting to the export format. Please try again."
           });
+          setLoading(null);
         })
         .finally(() => {
           isExporting = false;
